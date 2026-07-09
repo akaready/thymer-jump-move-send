@@ -1,0 +1,18 @@
+{
+	"ver": 1,
+	"name": "Jump Move Send",
+	"icon": "calendar-event",
+	"description": "Jump to, move to, or send to any journal day.",
+	"instructions": "Use the command palette to jump to, move, or send items to any journal day. Configure confirmation and defaults here before running commands.",
+	"author": "@akaready",
+	"homepage": "https://akaready.com",
+	"repository": "https://github.com/akaready/thymer-jump-move-send",
+	"coffee": "https://buymeacoffee.com/akaready",
+	"version": "1.0.0",
+	"__source_repo": "https://github.com/akaready/thymer-jump-move-send",
+	"__source_files": {
+		"branch": "main",
+		"json": "plugin.json",
+		"js": "plugin.js"
+	}
+}
