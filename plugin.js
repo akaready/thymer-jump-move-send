@@ -278,6 +278,7 @@ var plugins = (() => {
   line-height: 1;
   color: var(--tps-text-muted);
   transform: translateY(2px);
+  margin-right: var(--tps-space-1, 4px);
 }
 
 .tps-plugin-header-iconify {
@@ -1472,7 +1473,7 @@ var plugins = (() => {
   __name(optionRow, "optionRow");
 
   // plugin.js
-  var PLUGIN_VERSION = "1.0.0";
+  var PLUGIN_VERSION = "1.0.1";
   var ROOT_CLASS = "plg-jump-move-send";
   var PANEL_TYPE = "jump-move-send-settings";
   var STORAGE_KEY_BASE = "jump-move-send";
