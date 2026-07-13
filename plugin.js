@@ -2662,15 +2662,229 @@ ${report}
   }
   __name(setPluginDisabled, "setPluginDisabled");
 
+  // ../../shared/plugin-settings.js
+  function createSettingsStore(plugin, {
+    slug,
+    key = "settings",
+    version,
+    normalize = /* @__PURE__ */ __name((raw) => raw && typeof raw === "object" ? raw : {}, "normalize"),
+    scopeKey = null,
+    readSynced = null,
+    pickSynced = null
+  }) {
+    const readSyncedBlob = readSynced || ((custom) => custom?.[key]);
+    const pickSyncedSubset = pickSynced || ((s) => s);
+    let current = {};
+    let diverged = false;
+    let pushInFlight = false;
+    const workspaceGuid = /* @__PURE__ */ __name(() => {
+      try {
+        const guid = plugin.getWorkspaceGuid?.();
+        if (guid) return guid;
+      } catch {
+      }
+      return "default";
+    }, "workspaceGuid");
+    const storageKey = /* @__PURE__ */ __name(() => {
+      const scope = scopeKey ? `/${scopeKey()}` : "";
+      return `${slug}/${workspaceGuid()}${scope}/settings`;
+    }, "storageKey");
+    const readCustom = /* @__PURE__ */ __name(() => {
+      try {
+        const conf = plugin.getConfiguration?.();
+        const custom = conf && conf.custom;
+        return custom && typeof custom === "object" ? (
+          /** @type {Record<string, unknown>} */
+          custom
+        ) : {};
+      } catch {
+        return {};
+      }
+    }, "readCustom");
+    const readLocalRaw = /* @__PURE__ */ __name(() => {
+      try {
+        const raw = localStorage.getItem(storageKey());
+        if (raw === null) return null;
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : {};
+      } catch {
+        return null;
+      }
+    }, "readLocalRaw");
+    const normalizedStringify = /* @__PURE__ */ __name((raw) => JSON.stringify(normalize(raw)), "normalizedStringify");
+    const store = {
+      /** Read-only: never writes either store. */
+      load() {
+        const local = readLocalRaw();
+        if (local !== null) {
+          current = normalize(local);
+          diverged = true;
+        } else {
+          current = normalize(readSyncedBlob(readCustom()) || {});
+          diverged = false;
+        }
+        return { settings: current, diverged };
+      },
+      get() {
+        return current;
+      },
+      isDiverged() {
+        return diverged;
+      },
+      /**
+       * Every edit is device-local. First edit snapshots the FULL settings
+       * (inherited values of untouched keys survive). localStorage throwing
+       * (private mode) leaves the edit in memory for the session — still
+       * reported diverged so the pill/push UI works, and push still syncs.
+       */
+      update(patch) {
+        current = normalize({ ...current, ...patch });
+        if (normalizedStringify(readSyncedBlob(readCustom())) === JSON.stringify(current)) {
+          try {
+            localStorage.removeItem(storageKey());
+          } catch {
+          }
+          diverged = false;
+          return { settings: current, diverged };
+        }
+        diverged = true;
+        try {
+          localStorage.setItem(storageKey(), JSON.stringify(current));
+        } catch {
+        }
+        return { settings: current, diverged };
+      },
+      /**
+       * The explicit ↑ "Apply to all devices": ONE saveConfiguration (which
+       * reloads the plugin), then the local blob is cleared so this device
+       * goes back to following the synced config. Resolves true when the
+       * settings are known to be in synced config (pushed or already equal).
+       */
+      async pushToAll() {
+        if (pushInFlight) return false;
+        pushInFlight = true;
+        try {
+          const api = await resolveConfigApi(plugin);
+          if (!api || typeof api.saveConfiguration !== "function") return false;
+          let conf = {};
+          try {
+            conf = api.getConfiguration?.() || plugin.getConfiguration?.() || {};
+          } catch {
+            return false;
+          }
+          if (typeof conf.name !== "string" || !conf.name.trim()) return false;
+          const custom = conf.custom && typeof conf.custom === "object" ? conf.custom : {};
+          const subset = pickSyncedSubset(normalize(current));
+          try {
+            localStorage.removeItem(storageKey());
+          } catch {
+          }
+          diverged = false;
+          try {
+            if (normalizedStringify(readSyncedBlob(
+              /** @type {any} */
+              custom
+            )) !== normalizedStringify(subset)) {
+              await api.saveConfiguration(configWithPluginVersion(conf, { [key]: subset }, version));
+            }
+          } catch (err) {
+            try {
+              localStorage.setItem(storageKey(), JSON.stringify(current));
+            } catch {
+            }
+            diverged = true;
+            throw err;
+          }
+          return true;
+        } catch {
+          return false;
+        } finally {
+          pushInFlight = false;
+        }
+      },
+      /** The ↺ "Discard device changes": drop local, re-adopt synced. */
+      discardLocal() {
+        try {
+          localStorage.removeItem(storageKey());
+        } catch {
+        }
+        current = normalize(readSyncedBlob(readCustom()) || {});
+        diverged = false;
+        return current;
+      },
+      /**
+       * For folding into `setPluginDisabled(plugin, off, version, customPatch)`
+       * so a kill-switch toggle carries staged device settings in the SAME
+       * save (one reload, no race — CLAUDE.md rule). Call markFlushed() after
+       * that save succeeds if the fold should count as a push.
+       */
+      pendingCustomPatch() {
+        return diverged ? { [key]: pickSyncedSubset(normalize(current)) } : {};
+      },
+      markFlushed() {
+        try {
+          localStorage.removeItem(storageKey());
+        } catch {
+        }
+        diverged = false;
+      },
+      /**
+       * Live-follow for non-diverged devices: when another device pushes,
+       * `global-plugin.updated` fires here; re-read the synced blob and, if
+       * it changed semantically, hand the fresh settings to the plugin's
+       * central apply (which each plugin already guards with its kill
+       * switch). Returns a detach function for onUnload.
+       */
+      attachLifecycle({ onRemoteChange } = {}) {
+        const handlerIds = [];
+        try {
+          const id = plugin.events?.on?.("global-plugin.updated", (event) => {
+            try {
+              if (diverged) return;
+              if (event?.source?.isLocal) return;
+              const guid = plugin.getGuid?.();
+              const eventGuid = event?.pluginGuid || event?.guid || event?.rootId || null;
+              if (eventGuid && guid && eventGuid !== guid) return;
+              const next = normalize(readSyncedBlob(readCustom()) || {});
+              if (JSON.stringify(next) === JSON.stringify(current)) return;
+              current = next;
+              onRemoteChange?.(current);
+            } catch {
+            }
+          });
+          if (id) handlerIds.push(id);
+        } catch {
+        }
+        return () => {
+          for (const id of handlerIds) {
+            try {
+              plugin.events?.off?.(id);
+            } catch {
+            }
+          }
+        };
+      }
+    };
+    return store;
+  }
+  __name(createSettingsStore, "createSettingsStore");
+
   // plugin.js
-  var PLUGIN_VERSION = "1.1.6";
+  var PLUGIN_VERSION = "1.2.0";
   var ROOT_CLASS = "plg-jump-move-send";
   var PANEL_TYPE = "jump-move-send-settings";
-  var STORAGE_KEY_BASE = "jump-move-send";
   var DEFAULT_SETTINGS = Object.freeze({
     confirmBeforeMove: false,
     relativeToJournalPage: false
   });
+  function normalizeSettings(raw) {
+    const obj = raw && typeof raw === "object" ? raw : {};
+    return {
+      confirmBeforeMove: typeof obj.confirmBeforeMove === "boolean" ? obj.confirmBeforeMove : DEFAULT_SETTINGS.confirmBeforeMove,
+      relativeToJournalPage: typeof obj.relativeToJournalPage === "boolean" ? obj.relativeToJournalPage : DEFAULT_SETTINGS.relativeToJournalPage
+    };
+  }
+  __name(normalizeSettings, "normalizeSettings");
   var DATE_SPECS = [
     { suffix: "Today", kind: "days", offset: 0 },
     { suffix: "Tomorrow", kind: "days", offset: 1 },
@@ -2784,6 +2998,7 @@ ${report}
       this._classObserver = null;
       this._selectionOverlayObserver = null;
       this._panelEl = null;
+      this._detachSettingsLifecycle = null;
       this._lastSelectionGuids = /* @__PURE__ */ new Set();
       this._itemCache = /* @__PURE__ */ new Map();
       this._undoStack = [];
@@ -2799,7 +3014,13 @@ ${report}
           setTimeout(kick, 150);
         }
       };
-      this._settings = this._loadSettings();
+      this._settingsStore = createSettingsStore(this, {
+        slug: "jump-move-send",
+        key: "settings",
+        version: PLUGIN_VERSION,
+        normalize: normalizeSettings
+      });
+      this._settings = this._settingsStore.load().settings;
       this.ui.injectCSS(PANEL_CSS);
       this._settingsCmd = this.ui.addCommandPaletteCommand({
         label: "Plugin: Jump Move Send",
@@ -2817,6 +3038,13 @@ ${report}
         if (!root) return;
         this._panelEl = root;
         this._renderSettings();
+      });
+      this._detachSettingsLifecycle = this._settingsStore.attachLifecycle({
+        onRemoteChange: /* @__PURE__ */ __name((settings) => {
+          this._settings = settings;
+          this._applySettings();
+          if (this._panelEl && document.contains(this._panelEl)) this._renderSettings();
+        }, "onRemoteChange")
       });
       try {
         const staleRoot = document.querySelector(".plg-jump-move-send-panel");
@@ -3060,42 +3288,68 @@ ${report}
         }
       }
       this._diagCmd = null;
+      try {
+        this._detachSettingsLifecycle?.();
+      } catch {
+      }
+      this._detachSettingsLifecycle = null;
       this._undoStack = [];
       this._panelEl = null;
     }
     // ── Settings ────────────────────────────────────────────────────────
-    _storageKey() {
-      let guid = "default";
-      try {
-        guid = this.getWorkspaceGuid?.() || "default";
-      } catch {
-      }
-      return STORAGE_KEY_BASE + "/" + guid + "/settings";
-    }
-    _loadSettings() {
-      try {
-        const raw = JSON.parse(localStorage.getItem(this._storageKey()) || "{}");
-        const obj = raw && typeof raw === "object" ? raw : {};
-        return { ...DEFAULT_SETTINGS, ...obj };
-      } catch {
-        return { ...DEFAULT_SETTINGS };
-      }
-    }
-    _saveSettings() {
-      try {
-        localStorage.setItem(this._storageKey(), JSON.stringify(this._settings));
-      } catch {
-      }
-    }
     _updateSetting(key, value) {
       if (!Object.prototype.hasOwnProperty.call(DEFAULT_SETTINGS, key)) return;
-      this._settings = { ...this._settings, [key]: Boolean(value) };
-      this._saveSettings();
+      this._settings = this._settingsStore.update({ [key]: Boolean(value) }).settings;
       if (key === "relativeToJournalPage") {
-        this._updateBaseStatus();
-        this._registerBaseToggleCmd();
+        this._applySettings();
         if (this._panelEl && document.contains(this._panelEl)) this._renderSettings();
+        else this._refreshScopePill();
+      } else {
+        this._refreshScopePill();
       }
+    }
+    /**
+     * Central live-apply: refresh every non-panel surface that reflects
+     * settings (status-bar base label + base toggle command).
+     */
+    _applySettings() {
+      if (this._disabled) return;
+      this._updateBaseStatus();
+      this._registerBaseToggleCmd();
+    }
+    /**
+     * Scope-cluster wiring for the header pill: push = one saveConfiguration
+     * (the reload's hot-reload heal re-renders the panel); discard = two-tap
+     * armed in the shared cluster, then re-adopt synced values here.
+     */
+    _scopeArgs() {
+      return {
+        diverged: this._settingsStore.isDiverged(),
+        onPush: /* @__PURE__ */ __name(() => {
+          void this._settingsStore.pushToAll().then((ok) => {
+            if (!ok) return;
+            try {
+              this.ui.addToaster({ title: "Jump Move Send", message: "Settings applied to all devices", dismissible: true, autoDestroyTime: 3e3 });
+            } catch {
+            }
+            this._refreshScopePill();
+          });
+        }, "onPush"),
+        onDiscard: /* @__PURE__ */ __name(() => {
+          this._settings = this._settingsStore.discardLocal();
+          this._applySettings();
+          if (this._panelEl && document.contains(this._panelEl)) this._renderSettings();
+          try {
+            this.ui.addToaster({ title: "Jump Move Send", message: "Reverted to synced settings", dismissible: true, autoDestroyTime: 3e3 });
+          } catch {
+          }
+        }, "onDiscard")
+      };
+    }
+    /** Swap just the pill cluster — never nukes inputs mid-edit. */
+    _refreshScopePill() {
+      const el2 = this._panelEl?.querySelector?.(".tps-scope");
+      if (el2) el2.replaceWith(scopeCluster(this._scopeArgs()));
     }
     _baseStatusLabel() {
       return this._settings?.relativeToJournalPage ? "Date: Journal" : "Date: Today";
@@ -3144,8 +3398,12 @@ ${report}
       this._panelEl.replaceChildren(panel({ pluginClass: ROOT_CLASS + "-panel" }, [
         pluginHeaderFromConfig(conf, {
           version: PLUGIN_VERSION,
+          scope: this._scopeArgs(),
           killSwitch: {
             on: !this._disabled,
+            // The flag saves alone: device-local setting edits stay local
+            // (promoting them to all devices is the ↑ push's job, never a
+            // side effect of toggling the plugin).
             onToggle: /* @__PURE__ */ __name((nextOn) => void setPluginDisabled(this, !nextOn, PLUGIN_VERSION), "onToggle")
           },
           feedback: { data: this.data }
